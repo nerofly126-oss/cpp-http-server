@@ -17,7 +17,9 @@ namespace {
 constexpr uint64_t kListenerId = 0;
 constexpr uint64_t kWakeId = 1;
 constexpr int kMaxEvents = 128;
-constexpr int kIdleTimeoutSec = 10;
+constexpr int kIdleTimeoutSec = 10;      // no bytes at all for this long: drop the connection
+constexpr int kRequestTimeoutSec = 15;   // a request must finish arriving within this, however slowly it drips
+constexpr size_t kMaxConnsPerIp = 256;
 constexpr size_t kMaxConnections = 10000;
 constexpr size_t kMaxBufferedInput = kMaxHeaderBytes + kMaxBodyBytes + 4;
 
@@ -118,15 +120,19 @@ void Server::run(volatile std::sig_atomic_t& running) {
 
 void Server::accept_all() {
     for (;;) {
-        int fd = ::accept4(listener_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof peer;
+        int fd = ::accept4(listener_.get(), reinterpret_cast<sockaddr*>(&peer), &peer_len,
+                           SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             std::perror("accept4");  // e.g. EMFILE: raise `ulimit -n` for big load tests
             return;
         }
-        if (conns_.size() >= kMaxConnections) {
-            ::close(fd);
+        const uint32_t ip = peer.sin_addr.s_addr;
+        if (conns_.size() >= kMaxConnections || per_ip_[ip] >= kMaxConnsPerIp) {
+            ::close(fd);  // one client must not be able to eat every slot
             continue;
         }
 
@@ -138,6 +144,7 @@ void Server::accept_all() {
         c->fd = Fd(fd);
         c->last_active = Clock::now();
         c->events = EPOLLIN;
+        c->ip = ip;
 
         epoll_event ev{};
         ev.events = EPOLLIN;
@@ -146,6 +153,7 @@ void Server::accept_all() {
             std::perror("epoll_ctl add");
             continue;  // c goes out of scope and closes the fd
         }
+        ++per_ip_[ip];
         conns_.emplace(c->id, std::move(c));
     }
 }
@@ -155,7 +163,9 @@ void Server::on_readable(Conn& c) {
     ssize_t n = ::recv(c.fd.get(), buf, sizeof buf, 0);
 
     if (n > 0) {
-        c.last_active = Clock::now();
+        const auto now = Clock::now();
+        c.last_active = now;
+        if (c.in.empty()) c.request_start = now;  // first byte of a new request
         c.in.append(buf, static_cast<size_t>(n));
         if (c.in.size() > kMaxBufferedInput) {  // pipelining flood
             close_conn(c.id);
@@ -195,6 +205,7 @@ void Server::process_input(Conn& c) {
             return;
         case ParseStatus::Complete:
             c.in.erase(0, pr.consumed);
+            if (!c.in.empty()) c.request_start = Clock::now();  // pipelined bytes already waiting
             c.busy = true;
             submit(c.id, std::move(req));
             return;
@@ -301,7 +312,11 @@ void Server::update_events(Conn& c) {
 }
 
 void Server::close_conn(uint64_t id) {
-    conns_.erase(id);  // Fd destructor closes the socket and removes it from epoll
+    auto it = conns_.find(id);
+    if (it == conns_.end()) return;
+    auto ip = per_ip_.find(it->second->ip);
+    if (ip != per_ip_.end() && --ip->second == 0) per_ip_.erase(ip);
+    conns_.erase(it);  // Fd destructor closes the socket and removes it from epoll
 }
 
 void Server::expire_idle() {
@@ -312,7 +327,12 @@ void Server::expire_idle() {
     std::vector<uint64_t> expired;
     for (const auto& [id, c] : conns_) {
         if (c->busy) continue;  // a worker is on it, not the client's fault
-        if (now - c->last_active > std::chrono::seconds(kIdleTimeoutSec)) expired.push_back(id);
+        const bool idle = now - c->last_active > std::chrono::seconds(kIdleTimeoutSec);
+        // Slowloris: dripping one byte at a time keeps last_active fresh, so the
+        // request needs its own deadline measured from its first byte.
+        const bool too_slow = !c->in.empty() && !c->has_out() &&
+                              now - c->request_start > std::chrono::seconds(kRequestTimeoutSec);
+        if (idle || too_slow) expired.push_back(id);
     }
     for (uint64_t id : expired) {
         auto it = conns_.find(id);

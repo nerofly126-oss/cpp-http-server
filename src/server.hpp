@@ -35,7 +35,9 @@ private:
         bool close_after_write = false;
         bool peer_closed = false;
         uint32_t events = 0;  // what we currently ask epoll for
+        uint32_t ip = 0;      // peer IPv4 address, for the per-IP connection cap
         Clock::time_point last_active;
+        Clock::time_point request_start;  // when the current request's first byte arrived
         bool has_out() const { return out_off < out.size(); }
     };
 
@@ -64,6 +66,7 @@ private:
     Fd wake_;
     Fd listener_;
     std::unordered_map<uint64_t, std::unique_ptr<Conn>> conns_;
+    std::unordered_map<uint32_t, size_t> per_ip_;  // open connections per peer address
     uint64_t next_id_ = 2;  // 0 = listener, 1 = wake eventfd
     Clock::time_point last_sweep_ = Clock::now();
     std::mutex done_mu_;

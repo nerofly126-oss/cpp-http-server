@@ -1,3 +1,5 @@
 build/
 httpserver
 httpserver_fast
+fuzz_parser
+fuzz_standalone

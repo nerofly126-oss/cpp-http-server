@@ -8,6 +8,7 @@
 
 constexpr size_t kMaxHeaderBytes = 8 * 1024;
 constexpr size_t kMaxBodyBytes = 1024 * 1024;
+constexpr size_t kMaxHeaderCount = 100;
 
 struct Request {
     std::string method;

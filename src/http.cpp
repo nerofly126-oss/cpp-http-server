@@ -15,6 +15,16 @@ static std::string_view trim(std::string_view s) {
     return s;
 }
 
+// Control characters (NUL, bare CR or LF, ...) have no business inside a header
+// line. Letting them through is how request smuggling attacks start.
+static bool has_control_chars(std::string_view s) {
+    for (char c : s) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if ((u < 0x20 && u != '\t') || u == 0x7f) return true;
+    }
+    return false;
+}
+
 // ------------------------------------------------------------------ parsing
 
 // Parses the request line and headers. Returns 0, or the status to reply with.
@@ -23,6 +33,7 @@ static int parse_head(std::string_view head, Request& req) {
 
     size_t eol = head.find("\r\n");
     std::string_view line = head.substr(0, eol);
+    if (has_control_chars(line)) return 400;
 
     size_t sp1 = line.find(' ');
     size_t sp2 = (sp1 == npos) ? npos : line.find(' ', sp1 + 1);
@@ -33,21 +44,34 @@ static int parse_head(std::string_view head, Request& req) {
     req.version = std::string(line.substr(sp2 + 1));
 
     if (req.method.empty() || req.target.empty() || req.target[0] != '/') return 400;
-    if (req.version.compare(0, 5, "HTTP/") != 0) return 400;
+    if (req.version.compare(0, 5, "HTTP/") != 0 || req.version.find(' ') != npos) return 400;
     if (req.version != "HTTP/1.1" && req.version != "HTTP/1.0") return 505;
 
     std::string_view rest = (eol == npos) ? std::string_view{} : head.substr(eol + 2);
+    size_t header_count = 0;
     while (!rest.empty()) {
         size_t e = rest.find("\r\n");
         std::string_view h = rest.substr(0, e);
         rest = (e == npos) ? std::string_view{} : rest.substr(e + 2);
+
+        if (++header_count > kMaxHeaderCount) return 431;
+        if (has_control_chars(h)) return 400;
 
         size_t colon = h.find(':');
         if (colon == npos || colon == 0) return 400;
         std::string_view name = h.substr(0, colon);
         if (name.find_first_of(" \t") != npos) return 400;
 
-        req.headers[to_lower(std::string(name))] = std::string(trim(h.substr(colon + 1)));
+        std::string key = to_lower(std::string(name));
+        std::string value(trim(h.substr(colon + 1)));
+
+        // Two different Content-Length values: proxies and servers may disagree
+        // on which one wins, so refuse the request outright.
+        if (key == "content-length") {
+            auto dup = req.headers.find(key);
+            if (dup != req.headers.end() && dup->second != value) return 400;
+        }
+        req.headers[key] = value;
     }
     return 0;
 }
