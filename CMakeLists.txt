@@ -7,8 +7,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ENABLE_SANITIZERS "Build with ASan + UBSan" ON)
 
-add_executable(httpserver src/main.cpp src/http.cpp src/router.cpp)
+find_package(Threads REQUIRED)
+
+add_executable(httpserver src/main.cpp src/http.cpp src/router.cpp src/server.cpp)
 target_compile_options(httpserver PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(httpserver PRIVATE Threads::Threads)
 
 if(ENABLE_SANITIZERS)
   target_compile_options(httpserver PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)

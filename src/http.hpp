@@ -15,6 +15,7 @@ struct Request {
     std::string version;
     std::unordered_map<std::string, std::string> headers;  // names lowercased
     std::string body;
+    bool keep_alive = true;
 };
 
 struct Response {
@@ -25,10 +26,17 @@ struct Response {
     bool omit_body = false;  // HEAD: send headers only
 };
 
-// Reads one full request off the socket.
-// Returns 0 on success, -1 to drop silently, otherwise an HTTP error status.
-int read_request(int fd, Request& req);
+enum class ParseStatus { Incomplete, Complete, Error };
 
-std::string serialize(const Response& res);
+struct ParseResult {
+    ParseStatus status;
+    int error;        // HTTP status to reply with when status == Error
+    size_t consumed;  // bytes of the buffer used when status == Complete
+};
+
+// Tries to parse one request from the front of buf. Never blocks and never
+// reads from a socket: the event loop feeds it whatever has arrived so far.
+ParseResult parse_request(const std::string& buf, Request& req);
+
+std::string serialize(const Response& res, bool keep_alive);
 Response make_error(int status);
-bool send_all(int fd, std::string_view data);

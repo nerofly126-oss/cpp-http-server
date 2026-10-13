@@ -1,9 +1,6 @@
 #include "http.hpp"
 
-#include <sys/socket.h>
-
 #include <cctype>
-#include <cerrno>
 
 // ------------------------------------------------------------------ helpers
 
@@ -16,18 +13,6 @@ static std::string_view trim(std::string_view s) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
     return s;
-}
-
-bool send_all(int fd, std::string_view data) {
-    while (!data.empty()) {
-        ssize_t n = ::send(fd, data.data(), data.size(), MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        data.remove_prefix(static_cast<size_t>(n));
-    }
-    return true;
 }
 
 // ------------------------------------------------------------------ parsing
@@ -67,51 +52,41 @@ static int parse_head(std::string_view head, Request& req) {
     return 0;
 }
 
-// Reads at least one more byte. 0 = ok, 408 = timeout, -1 = peer closed/errored.
-static int recv_more(int fd, std::string& buf) {
-    char chunk[4096];
-    for (;;) {
-        ssize_t n = ::recv(fd, chunk, sizeof chunk, 0);
-        if (n > 0) {
-            buf.append(chunk, static_cast<size_t>(n));
-            return 0;
-        }
-        if (n == 0) return -1;
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 408;
-        return -1;
-    }
-}
-
-int read_request(int fd, Request& req) {
+ParseResult parse_request(const std::string& buf, Request& req) {
     const size_t npos = std::string::npos;
-    std::string buf;
-    size_t head_end;
 
-    while ((head_end = buf.find("\r\n\r\n")) == npos) {
-        if (buf.size() > kMaxHeaderBytes) return 431;
-        if (int rc = recv_more(fd, buf)) return rc;
+    size_t head_end = buf.find("\r\n\r\n");
+    if (head_end == npos) {
+        if (buf.size() > kMaxHeaderBytes) return {ParseStatus::Error, 431, 0};
+        return {ParseStatus::Incomplete, 0, 0};
     }
-    if (head_end > kMaxHeaderBytes) return 431;
+    if (head_end > kMaxHeaderBytes) return {ParseStatus::Error, 431, 0};
 
-    if (int rc = parse_head(std::string_view(buf).substr(0, head_end), req)) return rc;
-    if (req.headers.count("transfer-encoding")) return 501;
+    if (int rc = parse_head(std::string_view(buf).substr(0, head_end), req))
+        return {ParseStatus::Error, rc, 0};
+    if (req.headers.count("transfer-encoding")) return {ParseStatus::Error, 501, 0};
 
     size_t content_length = 0;
     auto it = req.headers.find("content-length");
     if (it != req.headers.end()) {
         const std::string& v = it->second;
-        if (v.empty() || v.size() > 10 || v.find_first_not_of("0123456789") != npos) return 400;
+        if (v.empty() || v.size() > 10 || v.find_first_not_of("0123456789") != npos)
+            return {ParseStatus::Error, 400, 0};
         content_length = std::stoul(v);
-        if (content_length > kMaxBodyBytes) return 413;
+        if (content_length > kMaxBodyBytes) return {ParseStatus::Error, 413, 0};
     }
 
-    req.body = buf.substr(head_end + 4);
-    while (req.body.size() < content_length) {
-        if (int rc = recv_more(fd, req.body)) return rc;
-    }
-    req.body.resize(content_length);
-    return 0;
+    const size_t total = head_end + 4 + content_length;
+    if (buf.size() < total) return {ParseStatus::Incomplete, 0, 0};
+
+    req.body = buf.substr(head_end + 4, content_length);
+
+    // HTTP/1.1 defaults to keep-alive, HTTP/1.0 defaults to close.
+    auto conn = req.headers.find("connection");
+    std::string value = (conn == req.headers.end()) ? "" : to_lower(conn->second);
+    req.keep_alive = (req.version == "HTTP/1.1") ? (value != "close") : (value == "keep-alive");
+
+    return {ParseStatus::Complete, 0, total};
 }
 
 // ---------------------------------------------------------------- responses
@@ -126,17 +101,18 @@ static const char* reason(int status) {
         case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
         case 431: return "Request Header Fields Too Large";
+        case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 505: return "HTTP Version Not Supported";
         default: return "Unknown";
     }
 }
 
-std::string serialize(const Response& res) {
+std::string serialize(const Response& res, bool keep_alive) {
     std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + reason(res.status) + "\r\n";
     out += "Content-Type: " + res.content_type + "\r\n";
     out += "Content-Length: " + std::to_string(res.body.size()) + "\r\n";
-    out += "Connection: close\r\n";
+    out += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     for (const auto& [name, value] : res.headers) out += name + ": " + value + "\r\n";
     out += "\r\n";
     if (!res.omit_body) out += res.body;

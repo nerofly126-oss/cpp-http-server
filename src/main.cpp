@@ -1,83 +1,48 @@
-// Phase 3: router with handlers, static file serving, path traversal protection.
-// Still blocking and one connection at a time. Concurrency is Phase 4.
+// Phase 4: epoll event loop, keep-alive, idle timeouts, worker thread pool.
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-
-#include <cerrno>
+#include <algorithm>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 
-#include "fd.hpp"
-#include "http.hpp"
 #include "router.hpp"
-
-constexpr int kRecvTimeoutSec = 5;
+#include "server.hpp"
 
 static volatile std::sig_atomic_t g_running = 1;
 
-static void on_sigint(int) { g_running = 0; }
+static void on_signal(int) { g_running = 0; }
 
 static void install_signal_handlers() {
     struct sigaction sa {};
-    sa.sa_handler = on_sigint;
+    sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;  // no SA_RESTART: accept() must return EINTR
+    sa.sa_flags = 0;  // epoll_wait returns EINTR so the loop notices
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
 }
 
-static Fd make_listener(uint16_t port) {
-    Fd fd(::socket(AF_INET, SOCK_STREAM, 0));
-    if (!fd) {
-        std::perror("socket");
-        std::exit(1);
-    }
-
-    int yes = 1;
-    setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
-
-    if (::bind(fd.get(), reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
-        std::perror("bind");
-        std::exit(1);
-    }
-    if (::listen(fd.get(), SOMAXCONN) < 0) {
-        std::perror("listen");
-        std::exit(1);
-    }
-    return fd;
-}
-
-static void handle_client(Fd client, const Router& router) {
-    // Without a timeout, one silent client freezes this whole server.
-    timeval tv{};
-    tv.tv_sec = kRecvTimeoutSec;
-    setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-
-    Request req;
-    int rc = read_request(client.get(), req);
-    if (rc == -1) return;  // client vanished, nothing to say
-
-    Response res = (rc == 0) ? router.dispatch(req) : make_error(rc);
-
-    std::printf("%s %s -> %d\n", req.method.c_str(), req.target.c_str(), res.status);
-    send_all(client.get(), serialize(res));
-}
-
 int main(int argc, char** argv) {
-    uint16_t port = argc > 1 ? static_cast<uint16_t>(std::atoi(argv[1])) : 8080;
-    std::string static_dir = argc > 2 ? argv[2] : "static";
+    // Usage: httpserver [port] [static_dir] [-q]
+    uint16_t port = 8080;
+    std::string static_dir = "static";
+    bool quiet = false;
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-q")
+            quiet = true;
+        else if (positional == 0) {
+            port = static_cast<uint16_t>(std::atoi(argv[i]));
+            ++positional;
+        } else if (positional == 1) {
+            static_dir = arg;
+            ++positional;
+        }
+    }
 
     Router router;
     router.add("GET", "/health", [](const Request&) {
@@ -90,22 +55,25 @@ int main(int argc, char** argv) {
         r.body = req.body;
         return r;
     });
+    // Demo for concurrency: a slow handler must not block other clients.
+    router.add("GET", "/slow", [](const Request&) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        Response r;
+        r.body = "finally\n";
+        return r;
+    });
     router.serve_static(static_dir);
 
     install_signal_handlers();
-    Fd listener = make_listener(port);
-    std::printf("Listening on http://0.0.0.0:%u, serving ./%s (Ctrl+C to stop)\n", port,
-                static_dir.c_str());
 
-    while (g_running) {
-        Fd client(::accept(listener.get(), nullptr, nullptr));
-        if (!client) {
-            if (errno == EINTR) continue;
-            std::perror("accept");
-            continue;
-        }
-        handle_client(std::move(client), router);
-    }
+    // Handlers can block on disk or sleeps, so don't size the pool by cores alone.
+    size_t workers = std::max<size_t>(4, std::thread::hardware_concurrency());
+
+    Server server(port, router, workers, !quiet);
+    std::printf("Listening on http://0.0.0.0:%u, serving ./%s, %zu workers (Ctrl+C to stop)\n",
+                port, static_dir.c_str(), workers);
+
+    server.run(g_running);
 
     std::puts("\nShutting down.");
     return 0;
