@@ -3,7 +3,10 @@
 // libFuzzer (needs clang), run from the project root so "static/" resolves:
 //   clang++ -std=c++17 -g -O1 -fsanitize=fuzzer,address,undefined \
 //       tests/fuzz_parser.cpp src/http.cpp src/router.cpp -o fuzz_parser
-//   ./fuzz_parser tests/corpus -max_total_time=60
+//   mkdir -p /tmp/corpus && ./fuzz_parser /tmp/corpus tests/corpus -max_total_time=60
+//
+// libFuzzer writes every new input it finds into the FIRST directory, so keep
+// that one outside the repo and let tests/corpus hold only the hand-written seeds.
 //
 // No clang? A plain g++ mutation loop works too:
 //   g++ -std=c++17 -g -O1 -DFUZZ_STANDALONE -fsanitize=address,undefined \
