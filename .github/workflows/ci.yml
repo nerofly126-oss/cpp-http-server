@@ -8,9 +8,9 @@ on:
 jobs:
   asan-ubsan:
     name: Tests under ASan + UBSan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
       - name: Build
@@ -22,9 +22,9 @@ jobs:
 
   tsan:
     name: Tests under ThreadSanitizer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
       - name: Build
@@ -34,9 +34,9 @@ jobs:
 
   fuzz:
     name: Fuzz the parser for 60 seconds
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Build the fuzzer
