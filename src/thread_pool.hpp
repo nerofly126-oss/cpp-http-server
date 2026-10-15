@@ -14,13 +14,18 @@ public:
         for (size_t i = 0; i < threads; ++i) workers_.emplace_back([this] { run(); });
     }
 
-    ~ThreadPool() {
+    ~ThreadPool() { stop(); }
+
+    // Finishes the queued jobs and joins the workers. Call it once nothing
+    // submits any more; calling it again is harmless.
+    void stop() {
         {
             std::lock_guard<std::mutex> lock(mu_);
             stop_ = true;
         }
         cv_.notify_all();
-        for (auto& t : workers_) t.join();
+        for (auto& t : workers_)
+            if (t.joinable()) t.join();
     }
 
     ThreadPool(const ThreadPool&) = delete;

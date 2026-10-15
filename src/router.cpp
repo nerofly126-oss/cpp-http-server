@@ -53,8 +53,26 @@ static std::string mime_type(const std::string& ext) {
 
 // ------------------------------------------------------------------- router
 
-void Router::add(const std::string& method, const std::string& path, Handler handler) {
-    routes_[path][method] = std::move(handler);
+void Router::add(const std::string& method, const std::string& path, Handler handler,
+                 RunOn where) {
+    routes_[path][method] = Route{std::move(handler), where};
+}
+
+bool Router::runs_on_loop(const Request& req) const {
+    std::string_view raw = req.target;
+    raw = raw.substr(0, raw.find('?'));
+
+    std::string path;
+    if (!percent_decode(raw, path)) return true;  // 400 is cheap
+
+    auto route = routes_.find(path);
+    if (route == routes_.end()) return false;  // static file or 404: may touch the disk
+
+    const auto& methods = route->second;
+    auto it = methods.find(req.method);
+    if (it == methods.end() && req.method == "HEAD") it = methods.find("GET");
+    if (it == methods.end()) return true;  // 405 is cheap
+    return it->second.where == RunOn::Loop;
 }
 
 Response Router::serve_file(const std::string& url_path) const {
@@ -101,12 +119,12 @@ Response Router::dispatch(const Request& req) const {
 
         if (handler == methods.end()) {
             std::string allow;
-            for (const auto& [m, h] : methods) allow += (allow.empty() ? "" : ", ") + m;
+            for (const auto& entry : methods) allow += (allow.empty() ? "" : ", ") + entry.first;
             Response r = make_error(405);
             r.headers.emplace_back("Allow", allow);
             return r;
         }
-        Response r = handler->second(req);
+        Response r = handler->second.handler(req);
         r.omit_body = head;
         return r;
     }

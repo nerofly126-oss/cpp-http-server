@@ -17,12 +17,13 @@ namespace {
 constexpr uint64_t kListenerId = 0;
 constexpr uint64_t kWakeId = 1;
 constexpr int kMaxEvents = 128;
-constexpr int kIdleTimeoutSec = 10;      // no bytes at all for this long: drop the connection
-constexpr int kRequestTimeoutSec = 15;   // a request must finish arriving within this, however slowly it drips
-constexpr size_t kMaxConnsPerIp = 256;
-constexpr size_t kMaxConnections = 10000;
+constexpr int kIdleTimeoutSec = 10;     // no bytes at all for this long: drop the connection
+constexpr int kRequestTimeoutSec = 15;  // a request must finish arriving within this, however slowly it drips
 constexpr size_t kMaxBufferedInput = kMaxHeaderBytes + kMaxBodyBytes + 4;
 
+// Every loop binds its own socket to the same port. SO_REUSEPORT lets them
+// coexist, and the kernel balances incoming connections across them by hashing
+// the client's address and port.
 Fd make_listener(uint16_t port) {
     Fd fd(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (!fd) {
@@ -32,6 +33,7 @@ Fd make_listener(uint16_t port) {
 
     int yes = 1;
     setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    setsockopt(fd.get(), SOL_SOCKET, SO_REUSEPORT, &yes, sizeof yes);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -63,13 +65,15 @@ void epoll_add(int ep, int fd, uint64_t id, uint32_t events) {
 
 // ------------------------------------------------------------------- setup
 
-Server::Server(uint16_t port, const Router& router, size_t workers, bool log_requests)
+Server::Server(uint16_t port, const Router& router, ThreadPool& pool, ConnLimiter& limiter,
+               bool log_requests)
     : router_(router),
+      pool_(pool),
+      limiter_(limiter),
       log_requests_(log_requests),
       ep_(::epoll_create1(EPOLL_CLOEXEC)),
       wake_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
-      listener_(make_listener(port)),
-      pool_(workers) {
+      listener_(make_listener(port)) {
     if (!ep_ || !wake_) {
         std::perror("epoll/eventfd");
         std::exit(1);
@@ -78,15 +82,25 @@ Server::Server(uint16_t port, const Router& router, size_t workers, bool log_req
     epoll_add(ep_.get(), wake_.get(), kWakeId, EPOLLIN);
 }
 
+void Server::wake() {
+    uint64_t one = 1;
+    ssize_t n = ::write(wake_.get(), &one, sizeof one);
+    (void)n;
+}
+
+void Server::log_request(const Request& req, int status) const {
+    if (log_requests_) std::printf("%s %s -> %d\n", req.method.c_str(), req.target.c_str(), status);
+}
+
 // -------------------------------------------------------------- event loop
 
-void Server::run(volatile std::sig_atomic_t& running) {
+void Server::run(const std::atomic<bool>& running) {
     epoll_event events[kMaxEvents];
 
-    while (running) {
+    while (running.load()) {
         int n = ::epoll_wait(ep_.get(), events, kMaxEvents, 1000);
         if (n < 0) {
-            if (errno == EINTR) continue;  // a signal arrived, re-check `running`
+            if (errno == EINTR) continue;
             std::perror("epoll_wait");
             break;
         }
@@ -130,8 +144,9 @@ void Server::accept_all() {
             std::perror("accept4");  // e.g. EMFILE: raise `ulimit -n` for big load tests
             return;
         }
+
         const uint32_t ip = peer.sin_addr.s_addr;
-        if (conns_.size() >= kMaxConnections || per_ip_[ip] >= kMaxConnsPerIp) {
+        if (!limiter_.try_acquire(ip)) {
             ::close(fd);  // one client must not be able to eat every slot
             continue;
         }
@@ -151,9 +166,10 @@ void Server::accept_all() {
         ev.data.u64 = c->id;
         if (::epoll_ctl(ep_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
             std::perror("epoll_ctl add");
+            limiter_.release(ip);
             continue;  // c goes out of scope and closes the fd
         }
-        ++per_ip_[ip];
+        ++accepted_;
         conns_.emplace(c->id, std::move(c));
     }
 }
@@ -190,29 +206,50 @@ void Server::on_readable(Conn& c) {
     close_conn(c.id);
 }
 
-// Parses at most one request and hands it to the pool. Called whenever new
-// bytes arrive or the previous response has been fully written.
+// Handles the requests waiting in the buffer, one at a time and in order.
+// Cheap ones are answered on the spot; the first slow one goes to the pool and
+// the loop stops there until its response is back. This is a loop and not
+// recursion on purpose: a client can pipeline thousands of tiny requests in one
+// buffer, and one stack frame per request would overflow the stack.
 void Server::process_input(Conn& c) {
-    if (c.busy || c.has_out() || c.close_after_write || c.in.empty()) return;
-
-    Request req;
-    ParseResult pr = parse_request(c.in, req);
-    switch (pr.status) {
-        case ParseStatus::Incomplete:
-            return;
-        case ParseStatus::Error:
+    while (!c.busy && !c.has_out() && !c.close_after_write && !c.in.empty()) {
+        Request req;
+        ParseResult pr = parse_request(c.in, req);
+        if (pr.status == ParseStatus::Incomplete) return;
+        if (pr.status == ParseStatus::Error) {
             respond_and_close(c, pr.error);
             return;
-        case ParseStatus::Complete:
-            c.in.erase(0, pr.consumed);
-            if (!c.in.empty()) c.request_start = Clock::now();  // pipelined bytes already waiting
+        }
+
+        c.in.erase(0, pr.consumed);
+        if (!c.in.empty()) c.request_start = Clock::now();  // pipelined bytes already waiting
+        ++requests_;
+
+        if (!router_.runs_on_loop(req)) {
             c.busy = true;
             submit(c.id, std::move(req));
             return;
+        }
+
+        Response res;
+        try {
+            res = router_.dispatch(req);
+        } catch (...) {
+            res = make_error(500);
+        }
+        log_request(req, res.status);
+        c.out = serialize(res, req.keep_alive);
+        c.out_off = 0;
+        if (!req.keep_alive) c.close_after_write = true;
+
+        // Done: go round again for the next pipelined request. Blocked: the
+        // socket buffer is full, EPOLLOUT will bring us back. Closed: c is gone.
+        if (write_out(c) != WriteResult::Done) return;
     }
 }
 
-bool Server::flush(Conn& c) {
+// Sends as much of c.out as the socket will take. Never calls process_input.
+Server::WriteResult Server::write_out(Conn& c) {
     const uint64_t id = c.id;
 
     while (c.has_out()) {
@@ -226,20 +263,29 @@ bool Server::flush(Conn& c) {
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             update_events(c);  // socket buffer full: wait for EPOLLOUT
-            return true;
+            return WriteResult::Blocked;
         }
         close_conn(id);
-        return false;
+        return WriteResult::Closed;
     }
 
     c.out.clear();
     c.out_off = 0;
     if (c.close_after_write) {
         close_conn(id);
-        return false;
+        return WriteResult::Closed;
     }
     update_events(c);
-    process_input(c);  // a pipelined request may already be waiting
+    return WriteResult::Done;
+}
+
+// Finishes a pending write, then picks up any request that was already queued.
+bool Server::flush(Conn& c) {
+    const uint64_t id = c.id;
+    WriteResult wr = write_out(c);
+    if (wr == WriteResult::Closed) return false;
+    if (wr == WriteResult::Blocked) return true;
+    process_input(c);
     return conns_.count(id) != 0;
 }
 
@@ -261,17 +307,14 @@ void Server::submit(uint64_t id, Request req) {
         } catch (...) {
             res = make_error(500);
         }
-        if (log_requests_)
-            std::printf("%s %s -> %d\n", req.method.c_str(), req.target.c_str(), res.status);
+        log_request(req, res.status);
 
         Done d{id, serialize(res, req.keep_alive), req.keep_alive};
         {
             std::lock_guard<std::mutex> lock(done_mu_);
             done_.push_back(std::move(d));
         }
-        uint64_t one = 1;
-        ssize_t n = ::write(wake_.get(), &one, sizeof one);  // wake the event loop
-        (void)n;
+        wake();  // tell this loop (and only this loop) its response is ready
     });
 }
 
@@ -314,8 +357,7 @@ void Server::update_events(Conn& c) {
 void Server::close_conn(uint64_t id) {
     auto it = conns_.find(id);
     if (it == conns_.end()) return;
-    auto ip = per_ip_.find(it->second->ip);
-    if (ip != per_ip_.end() && --ip->second == 0) per_ip_.erase(ip);
+    limiter_.release(it->second->ip);
     conns_.erase(it);  // Fd destructor closes the socket and removes it from epoll
 }
 

@@ -4,7 +4,8 @@
 Usage: integration_test.py <path-to-httpserver> [--slow]
 
 --slow adds the tests that wait on real timeouts (idle, stalled, slowloris).
-Uses only the Python standard library.
+Uses only the Python standard library. The server is always started with 4 event
+loops, so the multi-loop code runs no matter how many cores the machine has.
 """
 import os
 import signal
@@ -149,6 +150,33 @@ def test_connection_handling():
     check("server survives clients vanishing mid-request", status_of(b"GET /health HTTP/1.1\r\n\r\n") == 200)
 
 
+def test_pipeline_flood():
+    # 20000 tiny requests in one burst. Cheap requests are answered on the event
+    # loop, so handling them must be a loop, not recursion, or this overflows
+    # the stack. All 20000 responses must come back, in order, on one connection.
+    count = 20000
+    request = b"GET /health HTTP/1.1\r\n\r\n"
+    s = connect()
+    sender = threading.Thread(target=lambda: s.sendall(request * count))
+    sender.start()
+    received = b""
+    deadline = time.time() + 20
+    needle = b"HTTP/1.1 200 OK"
+    try:
+        while received.count(needle) < count and time.time() < deadline:
+            data = s.recv(1 << 20)
+            if not data:
+                break
+            received += data
+    except socket.timeout:
+        pass
+    sender.join()
+    s.close()
+    got = received.count(needle)
+    check("20000 pipelined requests answered (%d received)" % got, got == count)
+    check("server still healthy after the flood", status_of(b"GET /health HTTP/1.1\r\n\r\n") == 200)
+
+
 def test_concurrency():
     result = {}
 
@@ -255,6 +283,23 @@ def test_hardening():
     check("slots are freed when clients leave", status_of(b"GET /health HTTP/1.1\r\n\r\n") == 200)
 
 
+def test_refuses_a_port_that_is_taken(binary):
+    # SO_REUSEPORT would let a second copy silently share the port and split the
+    # traffic, so the server must notice and refuse.
+    second = subprocess.Popen([binary, str(PORT), os.path.join(ROOT, "static"), "-q", "-l", "4"],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        out, _ = second.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        second.kill()
+        out, _ = second.communicate()
+        check("second server on the same port refuses to start", False, "(it kept running)")
+        return
+    check("second server on the same port refuses to start",
+          second.returncode != 0 and "already in use" in out, "(exit code %s)" % second.returncode)
+    check("first server still answers afterwards", status_of(b"GET /health HTTP/1.1\r\n\r\n") == 200)
+
+
 def test_slow_timeouts():
     s = connect()
     t = time.time()
@@ -323,7 +368,7 @@ def main():
     PORT = probe.getsockname()[1]
     probe.close()
 
-    proc = subprocess.Popen([binary, str(PORT), os.path.join(ROOT, "static"), "-q"],
+    proc = subprocess.Popen([binary, str(PORT), os.path.join(ROOT, "static"), "-q", "-l", "4"],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if not wait_for_port(proc):
         proc.kill()
@@ -334,8 +379,10 @@ def main():
     try:
         test_basics()
         test_connection_handling()
+        test_pipeline_flood()
         test_concurrency()
         test_hardening()
+        test_refuses_a_port_that_is_taken(binary)
         if slow:
             test_slow_timeouts()
     finally:

@@ -1,0 +1,93 @@
+== environment
+cpu:      Intel(R) Core(TM) i3-5157U CPU @ 2.50GHz
+threads:  4
+kernel:   Linux 6.18.7-76061807-generic
+compiler: g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
+nginx:    nginx version: nginx/1.24.0 (Ubuntu)
+wrk:      wrk debian/4.1.0-4build2 [epoll] Copyright (C) 2012 Will Glozer
+settings: wrk -t4 -c100 -d10s, median of 3 runs, 2s warm-up
+
+== building (-O2)
+== cpp-http-server (4 loops)  http://127.0.0.1:8080/health
+   Latency     1.16ms    1.34ms  17.59ms   85.92%
+   Requests/sec: 101116.22
+   Latency     1.09ms    1.21ms  12.33ms   85.50%
+   Requests/sec: 102600.25
+   Latency     1.11ms    1.25ms  19.03ms   86.04%
+   Requests/sec: 102829.61
+   median: 102600.25 req/s
+
+== cpp-http-server (1 loop)  http://127.0.0.1:8083/health
+   Latency     1.43ms  295.74us   6.93ms   87.84%
+   Requests/sec:  69107.41
+   Latency     1.43ms  283.20us   6.61ms   88.04%
+   Requests/sec:  69227.26
+   Latency     1.43ms  340.08us   6.49ms   88.72%
+   Requests/sec:  68716.97
+   median: 69107.41 req/s
+
+== nginx (1 worker)  http://127.0.0.1:8081/health
+   Latency     1.95ms    1.13ms  72.58ms   99.09%
+   Requests/sec:  52004.06
+   Latency     1.91ms    1.19ms  72.76ms   99.70%
+   Requests/sec:  53191.10
+   Latency     1.95ms    1.50ms  81.56ms   99.68%
+   Requests/sec:  52546.95
+   median: 52546.95 req/s
+
+== nginx (auto: 4 workers)  http://127.0.0.1:8082/health
+   Latency     1.17ms    1.16ms  14.56ms   85.08%
+   Requests/sec:  90959.87
+   Latency     1.16ms    1.13ms  13.21ms   85.27%
+   Requests/sec:  90958.53
+   Latency     1.12ms    0.96ms  11.37ms   77.60%
+   Requests/sec:  89336.35
+   median: 90958.53 req/s
+
+== cpp-http-server (4 loops)  http://127.0.0.1:8080/index.html
+   Latency     2.66ms    1.25ms  14.40ms   71.43%
+   Requests/sec:  35971.04
+   Latency     2.66ms    1.27ms  15.09ms   71.70%
+   Requests/sec:  36037.22
+   Latency     2.75ms    1.32ms  16.33ms   71.88%
+   Requests/sec:  34994.00
+   median: 35971.04 req/s
+
+== cpp-http-server (1 loop)  http://127.0.0.1:8083/index.html
+   Latency     2.77ms    1.03ms  13.21ms   73.22%
+   Requests/sec:  34962.35
+   Latency     2.77ms    1.01ms  13.53ms   73.23%
+   Requests/sec:  34923.30
+   Latency     2.74ms    0.98ms  17.42ms   72.88%
+   Requests/sec:  35352.62
+   median: 34962.35 req/s
+
+== nginx (1 worker)  http://127.0.0.1:8081/index.html
+   Latency     3.77ms    1.65ms  98.69ms   98.05%
+   Requests/sec:  26809.13
+   Latency     3.77ms    3.01ms 138.55ms   99.69%
+   Requests/sec:  27358.86
+   Latency     3.92ms    5.26ms 181.19ms   99.48%
+   Requests/sec:  27518.01
+   median: 27358.86 req/s
+
+== nginx (auto: 4 workers)  http://127.0.0.1:8082/index.html
+   Latency     1.93ms    1.65ms  20.83ms   73.12%
+   Requests/sec:  55087.25
+   Latency     2.00ms    1.60ms  18.27ms   72.94%
+   Requests/sec:  51844.91
+   Latency     1.98ms    1.58ms  22.56ms   73.59%
+   Requests/sec:  51960.23
+   median: 51960.23 req/s
+
+== summary (median requests/sec)
+| Server | Path | Requests/sec |
+|---|---|---|
+| cpp-http-server (4 loops) | `/health` | 102600.25 |
+| cpp-http-server (1 loop) | `/health` | 69107.41 |
+| nginx (1 worker) | `/health` | 52546.95 |
+| nginx (auto: 4 workers) | `/health` | 90958.53 |
+| cpp-http-server (4 loops) | `/index.html` | 35971.04 |
+| cpp-http-server (1 loop) | `/index.html` | 34962.35 |
+| nginx (1 worker) | `/index.html` | 27358.86 |
+| nginx (auto: 4 workers) | `/index.html` | 51960.23 |

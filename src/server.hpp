@@ -1,6 +1,6 @@
 #pragma once
+#include <atomic>
 #include <chrono>
-#include <csignal>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -8,19 +8,32 @@
 #include <unordered_map>
 #include <vector>
 
+#include "conn_limiter.hpp"
 #include "fd.hpp"
 #include "http.hpp"
 #include "router.hpp"
 #include "thread_pool.hpp"
 
-// One epoll event loop owns every socket. Complete requests are handed to a
-// worker pool; workers send finished responses back through an eventfd.
+// One epoll event loop. The program runs several, one per core. Each has its
+// own listening socket bound with SO_REUSEPORT, so the kernel spreads new
+// connections across the loops, and each owns its connections outright: no
+// other thread ever touches one. Cheap handlers run right on the loop; blocking
+// ones go to a worker pool shared by all loops, and the result comes back
+// through the originating loop's own eventfd.
 class Server {
 public:
-    Server(uint16_t port, const Router& router, size_t workers, bool log_requests);
+    Server(uint16_t port, const Router& router, ThreadPool& pool, ConnLimiter& limiter,
+           bool log_requests);
 
-    // Runs the loop until `running` becomes 0 (cleared by a signal handler).
-    void run(volatile std::sig_atomic_t& running);
+    // Runs the loop until `running` becomes false.
+    void run(const std::atomic<bool>& running);
+
+    // Makes run() notice a change to `running` right away. Safe from any thread.
+    void wake();
+
+    // Only meaningful after run() has returned.
+    uint64_t accepted() const { return accepted_; }
+    uint64_t requests() const { return requests_; }
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -35,7 +48,7 @@ private:
         bool close_after_write = false;
         bool peer_closed = false;
         uint32_t events = 0;  // what we currently ask epoll for
-        uint32_t ip = 0;      // peer IPv4 address, for the per-IP connection cap
+        uint32_t ip = 0;      // peer IPv4 address, for the connection limits
         Clock::time_point last_active;
         Clock::time_point request_start;  // when the current request's first byte arrived
         bool has_out() const { return out_off < out.size(); }
@@ -47,9 +60,12 @@ private:
         bool keep_alive;
     };
 
+    enum class WriteResult { Done, Blocked, Closed };
+
     void accept_all();
     void on_readable(Conn& c);
     void process_input(Conn& c);
+    WriteResult write_out(Conn& c);
     bool flush(Conn& c);  // false if the connection was closed
     void respond_and_close(Conn& c, int status);
     void drain_completions();
@@ -57,19 +73,20 @@ private:
     void update_events(Conn& c);
     void close_conn(uint64_t id);
     void submit(uint64_t id, Request req);
+    void log_request(const Request& req, int status) const;
 
-    // Declaration order matters: pool_ is last so it is destroyed first,
-    // while the queue and eventfd its workers use are still alive.
     const Router& router_;
+    ThreadPool& pool_;
+    ConnLimiter& limiter_;
     bool log_requests_;
     Fd ep_;
     Fd wake_;
     Fd listener_;
     std::unordered_map<uint64_t, std::unique_ptr<Conn>> conns_;
-    std::unordered_map<uint32_t, size_t> per_ip_;  // open connections per peer address
     uint64_t next_id_ = 2;  // 0 = listener, 1 = wake eventfd
     Clock::time_point last_sweep_ = Clock::now();
+    uint64_t accepted_ = 0;
+    uint64_t requests_ = 0;
     std::mutex done_mu_;
     std::vector<Done> done_;
-    ThreadPool pool_;
 };

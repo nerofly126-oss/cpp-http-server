@@ -8,8 +8,8 @@ It is a learning project, not a replacement for nginx. The point was to understa
 
 ## Features
 
-- **Event loop:** one `epoll` thread owns every socket, all non-blocking, level-triggered.
-- **Worker pool:** complete requests are handed to a thread pool, so slow handlers (disk reads, sleeps) never stall other clients.
+- **Event loops:** one `epoll` loop per core. Each loop owns its connections outright, and the kernel balances new connections between loops with `SO_REUSEPORT`. All sockets are non-blocking and level-triggered.
+- **Worker pool:** handlers that may block (disk reads, sleeps) run on a shared thread pool, so they never stall a loop. Cheap handlers run right on the loop and skip the handoff.
 - **HTTP/1.1:** keep-alive, pipelining, `HEAD`, `Content-Length` bodies, percent-decoded paths, query strings, correct `405` with an `Allow` header.
 - **Static files:** MIME types, `index.html` for directories, and path traversal protection that resolves `..` and symlinks before checking the web root.
 - **Hardening:** size and count limits, per-request deadlines, per-IP connection cap, and strict header parsing (see below).
@@ -18,27 +18,30 @@ It is a learning project, not a replacement for nginx. The point was to understa
 
 ```mermaid
 flowchart LR
-    C["Clients"] --> L["epoll event loop (1 thread)"]
-    L -->|"complete request"| P["Worker pool (4+ threads)"]
-    P --> R["Router"]
-    R --> H["Handlers"]
-    R --> S["Static files"]
+    C["Clients"] --> L["Event loops (one per core)"]
+    L -->|"cheap handlers run here"| H["Handlers"]
+    L -->|"blocking handlers"| P["Shared worker pool"]
+    P --> H
+    P --> S["Static files"]
     P -->|"response bytes + eventfd wake"| L
     L --> C
 ```
 
 The life of a request:
 
-1. The event loop accepts the connection and reads whatever bytes have arrived.
+1. The kernel hands the new connection to one of the loops. That loop accepts it and reads whatever bytes have arrived.
 2. `parse_request` looks at the buffer and answers one of three things: incomplete (wait for more bytes), complete (here is the request and how many bytes it used), or an error status. It never touches a socket.
-3. A complete request goes to the worker pool. The connection is marked busy, so only one request per connection is in flight and pipelined responses stay in order.
-4. A worker runs the router, serializes the response, and wakes the loop through an `eventfd`.
+3. A cheap handler (like `/health`) runs on the loop itself and the response is written immediately. Anything that may block goes to the worker pool, and the connection is marked busy, so only one request per connection is in flight and pipelined responses stay in order.
+4. A worker runs the router, serializes the response, and wakes the loop that owns the connection through that loop's `eventfd`.
 5. The loop writes the response (waiting for `EPOLLOUT` if the socket buffer is full), then either closes the connection or parses the next pipelined request.
 
 Design decisions worth knowing:
 
 - Connections are looked up by a monotonically increasing id, never by pointer or file descriptor. A worker finishing after its client left, or a stale event in the same `epoll_wait` batch, then finds nothing and is dropped safely.
-- All connection state is touched by the event loop thread only. Workers communicate through one mutex-protected queue plus the `eventfd`.
+- A connection belongs to exactly one loop, and only that loop's thread touches it. Workers talk back through a mutex-protected queue plus that loop's `eventfd`.
+- Connection limits are shared by all loops through one limiter, because the kernel spreads a single client's connections across every loop. Its mutex is taken when a connection opens or closes, never per request.
+- Pipelined requests are handled in a loop, not by recursion, so a client cannot overflow the stack by packing thousands of tiny requests into one buffer.
+- `SO_REUSEPORT` would let a second copy of the server share the port silently and split the traffic, so the server refuses to start if anything already answers on its port.
 - A client that half-closes its side still receives its response.
 
 ## Build and run
@@ -58,7 +61,7 @@ g++ -std=c++17 -O2 -pthread src/*.cpp -o httpserver
 ./httpserver 8080
 ```
 
-Usage: `httpserver [port] [static_dir] [-q]`. The default port is 8080, the default static directory is `./static`, and `-q` turns off per-request logging (use it when benchmarking).
+Usage: `httpserver [port] [static_dir] [-q] [-l loops] [-w workers]`. The default port is 8080, the default static directory is `./static`, and `-q` turns off per-request logging (use it when benchmarking). `-l` sets the number of event loops (default: one per core) and `-w` the worker pool size (default: at least 4). `-l 1` gives the single-loop behaviour, which is handy for comparisons.
 
 Built-in routes: `GET /health`, `POST /echo`, and `GET /slow` (sleeps 2 seconds, to demonstrate that other clients are not blocked). Everything else is served from the static directory.
 
@@ -80,8 +83,8 @@ The parser also rejects control characters (NUL, bare CR or LF) in the request l
 
 ## Testing
 
-- **Unit tests** (`tests/unit_tests.cpp`, 21 tests): parser edge cases (including checking that every prefix of a request body reports "incomplete"), serializer, router, and static files with real symlink escape attempts.
-- **Integration tests** (`tests/integration_test.py`, 38 checks): start the real binary and talk to it over raw sockets. Covers keep-alive, pipelining, split packets, half-closed clients, parallel slow handlers, 200 concurrent connections, the per-IP cap, and the timeouts.
+- **Unit tests** (`tests/unit_tests.cpp`, 24 tests): parser edge cases (including checking that every prefix of a request body reports "incomplete"), serializer, router, the shared connection limiter under concurrent use, and static files with real symlink escape attempts.
+- **Integration tests** (`tests/integration_test.py`, 42 checks): start the real binary with four event loops and talk to it over raw sockets. Covers keep-alive, pipelining (including 20,000 requests in one burst), split packets, half-closed clients, parallel slow handlers, 200 concurrent connections, the per-IP cap, refusing a port that is already taken, and the timeouts.
 - **Sanitizers:** the whole suite runs under AddressSanitizer + UndefinedBehaviorSanitizer, and separately under ThreadSanitizer.
 - **Fuzzing:** `tests/fuzz_parser.cpp` is a libFuzzer target that drives the parser, router, and serializer together and asserts invariants.
 - **CI:** GitHub Actions runs all of the above on every push.
@@ -101,14 +104,25 @@ mkdir -p /tmp/corpus && ./fuzz_parser /tmp/corpus tests/corpus -max_total_time=6
 
 ## Benchmarks
 
-Measured with `wrk -t4 -c100 -d10s` against an `-O2` build with logging off (`-q`). `wrk` and the server ran on the same 4-thread machine, so treat the numbers as a way to compare runs of this server, not as a claim about absolute performance. No socket errors or non-2xx responses were reported.
+`bench/compare_nginx.sh` builds the server with `-O2` and benchmarks it against nginx on the same machine, serving the same file, with the same `wrk` settings (`wrk -t4 -c100 -d10s`, median of 3 runs after a 2 second warm-up). It checks that every server returns identical bytes before it starts, and it runs nginx with one worker and with one worker per hardware thread. The raw output of the run below is in `bench/results.txt`.
 
-| Endpoint | Requests/sec | Avg latency | Max latency |
-|---|---|---|---|
-| `/health` (no I/O) | 45,939 | 2.19 ms | 12.7 ms |
-| `/index.html` (reads from disk) | 31,032 | 3.19 ms | 29.3 ms |
+Machine: Intel Core i3-5157U, 4 hardware threads, Linux 6.18.7, g++ 13.3.0, nginx 1.24.0, wrk 4.1.0. `wrk` runs on the same machine as the servers and competes with them for the same four threads, so read the table as a comparison between rows of one run, not as absolute performance. Numbers from different runs or different days are not comparable: on this machine, individual runs of the same server varied by 10 to 30%.
 
-Static files are slower because every request resolves the path (`canonical`, symlink and web-root checks), then opens and reads the file. There is no cache.
+Requests per second (median of 3):
+
+| Server | `/health` (no I/O) | `/index.html` (reads a file) |
+|---|---|---|
+| cpp-http-server, 4 event loops | 102,600 | 36,000 |
+| cpp-http-server, 1 event loop | 69,100 | 35,000 |
+| nginx, 1 worker | 52,500 | 27,400 |
+| nginx, 4 workers (`auto`) | 91,000 | 52,000 |
+
+What the numbers say:
+
+- **Trivial responses:** four loops are about 1.5x faster than one (102,600 against 69,100), and roughly on par with nginx's four workers (91,000). The 13% lead over nginx is about the size of the run-to-run variation, so I do not claim it. With one worker or loop each, this server is ahead by about 30%.
+- **Static files:** nginx with four workers is about 1.4x faster (52,000 against 36,000). Adding event loops barely helps here (36,000 against 35,000), because static files still go through the shared worker pool. The cost is in the path resolution, the file read, and the handoff, not in the loop. I have not profiled it. The obvious next steps are caching file contents and using `sendfile()`.
+
+nginx was configured with its access log off, `sendfile on`, `keepalive_requests` raised so it does not hang up on `wrk`, and no `open_file_cache`; turning that cache on would widen the gap on static files. The servers do not send identical headers (nginx adds `Server`, `Date`, `Last-Modified` and `ETag`), so response sizes differ slightly.
 
 ## Known limitations
 
@@ -116,6 +130,7 @@ Static files are slower because every request resolves the path (`canonical`, sy
 - IPv4 only, so the per-IP cap is IPv4 only too.
 - No TLS, no HTTP/2, no chunked request bodies.
 - Static files are read fully into memory. `sendfile()` would be the proper fix for large files.
+- Static file throughput is about 1.4x below nginx on the same machine (see Benchmarks).
 - A request body must arrive within the 15 second deadline, so uploads need roughly 70 KB/s or better.
 
 ## Project layout
@@ -123,7 +138,8 @@ Static files are slower because every request resolves the path (`canonical`, sy
 ```
 src/
   main.cpp          route setup, signals, argument parsing
-  server.{hpp,cpp}  epoll event loop and connection state machine
+  server.{hpp,cpp}  one epoll event loop and its connection state machine
+  conn_limiter.hpp  per-IP and total connection limits shared by all loops
   http.{hpp,cpp}    incremental request parser, response serializer
   router.{hpp,cpp}  routing, percent-decoding, static files
   thread_pool.hpp   fixed-size worker pool

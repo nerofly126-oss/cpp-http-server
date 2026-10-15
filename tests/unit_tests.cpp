@@ -3,7 +3,10 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include "conn_limiter.hpp"
 #include "http.hpp"
 #include "router.hpp"
 #include "test.hpp"
@@ -257,6 +260,56 @@ TEST(router_decodes_percent_escapes) {
     CHECK_EQ(router.dispatch(make_request("GET", "/a%20b")).status, 200);
     CHECK_EQ(router.dispatch(make_request("GET", "/a%zz")).status, 400);
     CHECK_EQ(router.dispatch(make_request("GET", "/a%4")).status, 400);
+}
+
+TEST(router_runs_cheap_handlers_on_the_loop_and_the_rest_on_workers) {
+    Router router;
+    router.add("GET", "/fast", [](const Request&) { return text_response("x"); }, RunOn::Loop);
+    router.add("GET", "/slow", [](const Request&) { return text_response("x"); });  // default: Worker
+    router.serve_static("static");
+
+    CHECK(router.runs_on_loop(make_request("GET", "/fast")));
+    CHECK(router.runs_on_loop(make_request("HEAD", "/fast")));
+    CHECK(router.runs_on_loop(make_request("GET", "/fast?x=1")));
+    CHECK(!router.runs_on_loop(make_request("GET", "/slow")));
+    CHECK(!router.runs_on_loop(make_request("GET", "/index.html")));  // static file: may touch disk
+    CHECK(!router.runs_on_loop(make_request("GET", "/missing")));
+    CHECK(router.runs_on_loop(make_request("DELETE", "/fast")));      // 405 is cheap
+    CHECK(router.runs_on_loop(make_request("GET", "/fast%zz")));      // 400 is cheap
+}
+
+// ---------------------------------------------------------- connection limits
+
+TEST(limiter_enforces_per_ip_and_total_caps) {
+    ConnLimiter limiter(5, 2);
+    CHECK(limiter.try_acquire(1));
+    CHECK(limiter.try_acquire(1));
+    CHECK(!limiter.try_acquire(1));  // third from the same address
+    CHECK(limiter.try_acquire(2));   // a different address is unaffected
+    CHECK(limiter.try_acquire(2));
+    CHECK(limiter.try_acquire(3));
+    CHECK_EQ(limiter.total(), static_cast<size_t>(5));
+    CHECK(!limiter.try_acquire(4));  // total cap reached
+
+    limiter.release(1);
+    CHECK(limiter.try_acquire(4));   // a slot opened up
+    CHECK(limiter.try_acquire(1) == false);  // but the total is full again
+    CHECK_EQ(limiter.total(), static_cast<size_t>(5));
+}
+
+TEST(limiter_stays_consistent_under_concurrent_use) {
+    ConnLimiter limiter(1000, 50);
+    std::vector<std::thread> threads;
+    for (uint32_t t = 0; t < 8; ++t) {
+        threads.emplace_back([&limiter, t] {
+            for (int i = 0; i < 20000; ++i) {
+                const uint32_t ip = (t + static_cast<uint32_t>(i)) % 4;
+                if (limiter.try_acquire(ip)) limiter.release(ip);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    CHECK_EQ(limiter.total(), static_cast<size_t>(0));
 }
 
 // ------------------------------------------------------------ static files
