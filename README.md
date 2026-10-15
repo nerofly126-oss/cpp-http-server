@@ -6,6 +6,49 @@ An HTTP/1.1 server written from scratch in C++17 on raw Linux sockets. No framew
 
 It is a learning project, not a replacement for nginx. The point was to understand what a framework like Express hides, and to build it with the same care a production server needs: limits, timeouts, sanitizers, fuzzing, and tests.
 
+## At a glance
+
+- **Close to nginx on small responses:** about 100,000 requests/sec on a trivial endpoint on a 4-thread laptop, roughly on par with nginx running four workers. On static files it is about 1.4x behind. Numbers and caveats are in [Benchmarks](#benchmarks).
+- **Concurrent by design:** one `epoll` event loop per core, plus a shared worker pool for anything that can block.
+- **Defensive:** size limits, per-request deadlines, a slowloris defence, a per-IP connection cap, and a parser that rejects request-smuggling tricks.
+- **Heavily tested:** 24 unit tests, 42 end-to-end checks, AddressSanitizer, UndefinedBehaviorSanitizer, ThreadSanitizer, and a libFuzzer target, all run in CI on every push.
+
+## Quick start
+
+Requires Linux (it uses `epoll`), a C++17 compiler, and CMake 3.16 or newer.
+
+```
+cmake -S . -B build
+cmake --build build -j
+./build/httpserver 8080
+```
+
+Then, from another terminal:
+
+```
+curl -i localhost:8080/health                          # handled directly on the event loop
+curl -d 'hello' localhost:8080/echo                    # echoes the body back
+curl -i localhost:8080/                                # static page from ./static
+curl -i --path-as-is localhost:8080/../src/main.cpp    # 403: path traversal blocked
+```
+
+The first request prints:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 3
+Connection: keep-alive
+
+ok
+```
+
+No CMake? Plain g++ works too: `g++ -std=c++17 -O2 -pthread src/*.cpp -o httpserver`.
+
+Usage: `httpserver [port] [static_dir] [-q] [-l loops] [-w workers]`. The default port is 8080, the default static directory is `./static`, and `-q` turns off per-request logging (use it when benchmarking). `-l` sets the number of event loops (default: one per core) and `-w` the worker pool size (default: at least 4). `-l 1` gives the single-loop behaviour, which is handy for comparisons.
+
+Built-in routes: `GET /health`, `POST /echo`, and `GET /slow` (sleeps 2 seconds, to demonstrate that other clients are not blocked). Everything else is served from the static directory.
+
 ## Features
 
 - **Event loops:** one `epoll` loop per core. Each loop owns its connections outright, and the kernel balances new connections between loops with `SO_REUSEPORT`. All sockets are non-blocking and level-triggered.
@@ -41,29 +84,8 @@ Design decisions worth knowing:
 - A connection belongs to exactly one loop, and only that loop's thread touches it. Workers talk back through a mutex-protected queue plus that loop's `eventfd`.
 - Connection limits are shared by all loops through one limiter, because the kernel spreads a single client's connections across every loop. Its mutex is taken when a connection opens or closes, never per request.
 - Pipelined requests are handled in a loop, not by recursion, so a client cannot overflow the stack by packing thousands of tiny requests into one buffer.
-- `SO_REUSEPORT` would let a second copy of the server share the port silently and split the traffic, so the server refuses to start if anything already answers on its port.
+- `SO_REUSEPORT` would let a second copy of the server share the port silently and split the traffic, so the server refuses to start if anything already answers on its port on localhost.
 - A client that half-closes its side still receives its response.
-
-## Build and run
-
-Requires Linux (it uses `epoll`), a C++17 compiler, and CMake 3.16 or newer.
-
-```
-cmake -S . -B build
-cmake --build build -j
-./build/httpserver 8080
-```
-
-Or with plain g++:
-
-```
-g++ -std=c++17 -O2 -pthread src/*.cpp -o httpserver
-./httpserver 8080
-```
-
-Usage: `httpserver [port] [static_dir] [-q] [-l loops] [-w workers]`. The default port is 8080, the default static directory is `./static`, and `-q` turns off per-request logging (use it when benchmarking). `-l` sets the number of event loops (default: one per core) and `-w` the worker pool size (default: at least 4). `-l 1` gives the single-loop behaviour, which is handy for comparisons.
-
-Built-in routes: `GET /health`, `POST /echo`, and `GET /slow` (sleeps 2 seconds, to demonstrate that other clients are not blocked). Everything else is served from the static directory.
 
 ## Limits and hardening
 
@@ -94,7 +116,7 @@ ctest --test-dir build --output-on-failure
 python3 tests/integration_test.py build/httpserver --slow
 ```
 
-To fuzz locally (needs clang):
+The integration tests need Python 3 and nothing else. To fuzz locally (needs clang):
 
 ```
 clang++ -std=c++17 -g -O1 -fsanitize=fuzzer,address,undefined \
@@ -104,7 +126,7 @@ mkdir -p /tmp/corpus && ./fuzz_parser /tmp/corpus tests/corpus -max_total_time=6
 
 ## Benchmarks
 
-`bench/compare_nginx.sh` builds the server with `-O2` and benchmarks it against nginx on the same machine, serving the same file, with the same `wrk` settings (`wrk -t4 -c100 -d10s`, median of 3 runs after a 2 second warm-up). It checks that every server returns identical bytes before it starts, and it runs nginx with one worker and with one worker per hardware thread. The raw output of the run below is in `bench/results.txt`.
+`bench/compare_nginx.sh` builds the server with `-O2` and benchmarks it against nginx on the same machine, serving the same file, with the same `wrk` settings (`wrk -t4 -c100 -d10s`, median of 3 runs after a 2 second warm-up). It checks that every server returns identical bytes before it starts, and it runs nginx with one worker and with one worker per hardware thread. It needs `wrk` and `nginx` installed. The raw output of the run below is in `bench/results.txt`.
 
 Machine: Intel Core i3-5157U, 4 hardware threads, Linux 6.18.7, g++ 13.3.0, nginx 1.24.0, wrk 4.1.0. `wrk` runs on the same machine as the servers and competes with them for the same four threads, so read the table as a comparison between rows of one run, not as absolute performance. Numbers from different runs or different days are not comparable: on this machine, individual runs of the same server varied by 10 to 30%.
 
@@ -124,6 +146,13 @@ What the numbers say:
 
 nginx was configured with its access log off, `sendfile on`, `keepalive_requests` raised so it does not hang up on `wrk`, and no `open_file_cache`; turning that cache on would widen the gap on static files. The servers do not send identical headers (nginx adds `Server`, `Date`, `Last-Modified` and `ETag`), so response sizes differ slightly.
 
+## Pitfalls along the way
+
+- **TCP has no message boundaries.** A request can arrive in many pieces, and several can arrive at once. The parser is incremental: it reports "incomplete", or how many bytes the request used, and the unit tests cut a request at every possible position.
+- **An inactivity timeout is not enough.** A slowloris client keeps a connection looking busy, so each request also gets its own deadline from its first byte.
+- **I benchmarked the wrong binary once.** An old sanitizer build was still holding the port, so `wrk` reported about 9,400 requests/sec instead of about 46,000. The benchmark script now builds its own binary on its own ports, and the server refuses to start when something already answers on its port.
+- **Benchmark numbers wobble.** With the load generator on the same 4-thread machine, runs of the same server differed by 10 to 30%, so the table reports medians and the text declines to claim a 13% lead.
+
 ## Known limitations
 
 - Linux only (`epoll`, `eventfd`, `accept4`).
@@ -132,6 +161,13 @@ nginx was configured with its access log off, `sendfile on`, `keepalive_requests
 - Static files are read fully into memory. `sendfile()` would be the proper fix for large files.
 - Static file throughput is about 1.4x below nginx on the same machine (see Benchmarks).
 - A request body must arrive within the 15 second deadline, so uploads need roughly 70 KB/s or better.
+
+## What I would do next
+
+- Cache static file contents and use `sendfile()`, then profile the static path with `perf` to see what the remaining cost is.
+- Chunked request bodies and `Expect: 100-continue`.
+- IPv6, then TLS.
+- Try edge-triggered `epoll` and measure whether it matters at this scale.
 
 ## Project layout
 
@@ -145,5 +181,6 @@ src/
   thread_pool.hpp   fixed-size worker pool
   fd.hpp            RAII file descriptor
 tests/              unit, integration, and fuzz tests
+bench/              nginx comparison script and its raw results
 static/             sample web root
 ```
